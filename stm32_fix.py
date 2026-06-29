@@ -190,6 +190,36 @@ def _collect_defines(project_dir: Path) -> list[str]:
     return []
 
 
+def _system_include_paths(gcc_bin_dir: Path) -> list[str]:
+    """
+    Ask the compiler itself which system include directories it uses, then
+    return them as absolute path strings. This is the only reliable way to
+    find newlib and GCC-internal headers for a cross-compiler.
+    """
+    try:
+        result = subprocess.run(
+            [str(gcc_bin_dir / "arm-none-eabi-gcc"),
+             "-mcpu=cortex-m3", "-mthumb", "-E", "-x", "c", "-", "-v"],
+            input="", capture_output=True, text=True, timeout=10
+        )
+        # The paths appear between "#include <...> search starts here:" and
+        # "End of search list." in stderr
+        stderr = result.stderr
+        start = stderr.find("#include <...> search starts here:")
+        end = stderr.find("End of search list.")
+        if start == -1 or end == -1:
+            return []
+        block = stderr[start:end]
+        paths = []
+        for line in block.splitlines()[1:]:
+            line = line.strip()
+            if line and Path(line).is_dir():
+                paths.append(line)
+        return paths
+    except Exception:
+        return []
+
+
 def patch_c_cpp_properties(project_dir: Path, gcc_bin_dir: Path) -> None:
     vscode_dir = project_dir / ".vscode"
     props_path = vscode_dir / "c_cpp_properties.json"
@@ -213,6 +243,15 @@ def patch_c_cpp_properties(project_dir: Path, gcc_bin_dir: Path) -> None:
         ]
     if not defines:
         defines = ["STM32F103xB", "USE_HAL_DRIVER"]
+
+    # Always append the compiler's own system headers — VS Code doesn't reliably
+    # extract these from cross-compilers on its own.
+    system_paths = _system_include_paths(gcc_bin_dir)
+    if system_paths:
+        include_paths = include_paths + system_paths
+        print(f"  c_cpp_properties.json: added {len(system_paths)} system include paths.")
+    else:
+        print(f"  c_cpp_properties.json: WARNING – could not detect system include paths.")
 
     new_config = {
         "name": "STM32",
