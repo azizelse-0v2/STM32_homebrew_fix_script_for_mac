@@ -3,16 +3,19 @@
 STM32 project fix script for macOS.
 
 Run this from any STM32CubeMX project directory generated for VS Code to fix
-the two most common build failures when using Homebrew arm-none-eabi-gcc:
+the common issues when using Homebrew arm-none-eabi-gcc:
 
   1. Updates .stm32env (used by STM32Make.make / STM32-for-VSCode extension)
      to point ARM_GCC_PATH at an ARM GNU Toolchain that bundles newlib.
 
   2. Patches the CubeMX-generated Makefile so the -isystem flag points at a
      gcc that actually has a sysroot (so #include_next <stdint.h> resolves).
+
+  3. Patches .vscode/c_cpp_properties.json so IntelliSense uses the correct
+     compiler and finds all headers (eliminates red squiggles).
 """
 
-import os
+import json
 import re
 import sys
 import glob
@@ -148,6 +151,105 @@ def patch_makefile(makefile_path: Path, gcc_bin_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# .vscode/c_cpp_properties.json patching
+# ---------------------------------------------------------------------------
+
+def _collect_include_paths(project_dir: Path) -> list[str]:
+    """
+    Read C_INCLUDES from STM32Make.make (or Makefile) and return them as
+    ${workspaceFolder}-prefixed strings suitable for c_cpp_properties.json.
+    """
+    for name in ("STM32Make.make", "Makefile", "makefile"):
+        p = project_dir / name
+        if not p.exists():
+            continue
+        content = p.read_text()
+        # Extract -Ifoo/bar paths from C_INCLUDES block
+        paths = re.findall(r"-I(\S+)", content)
+        if paths:
+            return [f"${{workspaceFolder}}/{path.lstrip('/')}" for path in paths]
+    return []
+
+
+def _collect_defines(project_dir: Path) -> list[str]:
+    for name in ("STM32Make.make", "Makefile", "makefile"):
+        p = project_dir / name
+        if not p.exists():
+            continue
+        content = p.read_text()
+        defines = re.findall(r"-D(\S+)", content)
+        if defines:
+            # deduplicate while preserving order
+            seen: set[str] = set()
+            result = []
+            for d in defines:
+                if d not in seen:
+                    seen.add(d)
+                    result.append(d)
+            return result
+    return []
+
+
+def patch_c_cpp_properties(project_dir: Path, gcc_bin_dir: Path) -> None:
+    vscode_dir = project_dir / ".vscode"
+    props_path = vscode_dir / "c_cpp_properties.json"
+
+    gcc_path = str(gcc_bin_dir / "arm-none-eabi-gcc")
+    include_paths = _collect_include_paths(project_dir)
+    defines = _collect_defines(project_dir)
+
+    # Fall back to a known-good set if the Makefile parse came up empty
+    if not include_paths:
+        include_paths = [
+            "${workspaceFolder}/Core/Inc",
+            "${workspaceFolder}/Drivers/CMSIS/Device/ST/STM32F1xx/Include",
+            "${workspaceFolder}/Drivers/CMSIS/Include",
+            "${workspaceFolder}/Drivers/STM32F1xx_HAL_Driver/Inc",
+            "${workspaceFolder}/Drivers/STM32F1xx_HAL_Driver/Inc/Legacy",
+            "${workspaceFolder}/Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc",
+            "${workspaceFolder}/Middlewares/ST/STM32_USB_Device_Library/Core/Inc",
+            "${workspaceFolder}/USB_DEVICE/App",
+            "${workspaceFolder}/USB_DEVICE/Target",
+        ]
+    if not defines:
+        defines = ["STM32F103xB", "USE_HAL_DRIVER"]
+
+    new_config = {
+        "name": "STM32",
+        "includePath": include_paths,
+        "defines": defines,
+        "compilerPath": gcc_path,
+        "compilerArgs": ["-mcpu=cortex-m3", "-mthumb"],
+        "intelliSenseMode": "gcc-arm",
+        "cStandard": "c11",
+        "cppStandard": "c++14",
+    }
+
+    if props_path.exists():
+        try:
+            data = json.loads(props_path.read_text())
+        except json.JSONDecodeError:
+            data = {"configurations": [], "version": 4}
+    else:
+        vscode_dir.mkdir(exist_ok=True)
+        data = {"configurations": [], "version": 4}
+
+    # Replace or add the STM32 configuration
+    configs = data.get("configurations", [])
+    for i, cfg in enumerate(configs):
+        if cfg.get("name") == "STM32":
+            configs[i] = new_config
+            print(f"  c_cpp_properties.json: updated STM32 configuration.")
+            break
+    else:
+        configs.append(new_config)
+        print(f"  c_cpp_properties.json: added STM32 configuration.")
+
+    data["configurations"] = configs
+    props_path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -203,7 +305,11 @@ def main() -> None:
     else:
         print("  Makefile: not found – skipping")
 
-    print("\nDone. Run your build task in VS Code or: make -f STM32Make.make -j8 DEBUG=1")
+    # --- Patch .vscode/c_cpp_properties.json ---
+    patch_c_cpp_properties(project_dir, chosen_bin_dir)
+
+    print("\nDone. Reload VS Code (Cmd+Shift+P → 'Developer: Reload Window') to pick up IntelliSense changes.")
+    print("To build: make -f STM32Make.make -j8 DEBUG=1")
 
 
 if __name__ == "__main__":
