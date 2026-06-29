@@ -22,6 +22,12 @@ import glob
 import subprocess
 from pathlib import Path
 
+try:
+    import yaml
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Toolchain discovery
@@ -190,6 +196,51 @@ def _collect_defines(project_dir: Path) -> list[str]:
     return []
 
 
+def patch_stm32_config_yaml(project_dir: Path, gcc_bin_dir: Path) -> None:
+    """
+    Add the compiler's system include paths to STM32-for-VSCode.config.yaml
+    so the extension carries them into every c_cpp_properties.json regeneration.
+    Falls back to regex editing when the PyYAML library is not installed.
+    """
+    yaml_path = project_dir / "STM32-for-VSCode.config.yaml"
+    if not yaml_path.exists():
+        print("  STM32-for-VSCode.config.yaml: not found – skipping.")
+        return
+
+    system_paths = _system_include_paths(gcc_bin_dir)
+    if not system_paths:
+        print("  STM32-for-VSCode.config.yaml: could not detect system paths – skipping.")
+        return
+
+    content = yaml_path.read_text()
+
+    # Check which paths are already present and only add missing ones.
+    to_add = [p for p in system_paths if p not in content]
+    if not to_add:
+        print("  STM32-for-VSCode.config.yaml: system paths already present, no change needed.")
+        return
+
+    if _YAML_AVAILABLE:
+        data = yaml.safe_load(content)
+        dirs = data.get("includeDirectories") or []
+        for p in to_add:
+            if p not in dirs:
+                dirs.append(p)
+        data["includeDirectories"] = dirs
+        yaml_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True))
+    else:
+        # Regex fallback: append entries under the includeDirectories block.
+        new_entries = "\n".join(f"  - {p}" for p in to_add)
+        content = re.sub(
+            r"(includeDirectories\s*:\s*\n(?:[ \t]+-[^\n]*\n)*)",
+            lambda m: m.group(0) + new_entries + "\n",
+            content,
+        )
+        yaml_path.write_text(content)
+
+    print(f"  STM32-for-VSCode.config.yaml: added {len(to_add)} system include path(s).")
+
+
 def _system_include_paths(gcc_bin_dir: Path) -> list[str]:
     """
     Ask the compiler itself which system include directories it uses, then
@@ -213,8 +264,9 @@ def _system_include_paths(gcc_bin_dir: Path) -> list[str]:
         paths = []
         for line in block.splitlines()[1:]:
             line = line.strip()
-            if line and Path(line).is_dir():
-                paths.append(line)
+            p = Path(line).resolve()
+            if p.is_dir() and str(p) not in paths:
+                paths.append(str(p))
         return paths
     except Exception:
         return []
@@ -344,7 +396,10 @@ def main() -> None:
     else:
         print("  Makefile: not found – skipping")
 
-    # --- Patch .vscode/c_cpp_properties.json ---
+    # --- Patch STM32-for-VSCode.config.yaml (survives extension regeneration) ---
+    patch_stm32_config_yaml(project_dir, chosen_bin_dir)
+
+    # --- Patch .vscode/c_cpp_properties.json (immediate effect) ---
     patch_c_cpp_properties(project_dir, chosen_bin_dir)
 
     print("\nDone. Reload VS Code (Cmd+Shift+P → 'Developer: Reload Window') to pick up IntelliSense changes.")
